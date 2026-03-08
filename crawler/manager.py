@@ -7,12 +7,13 @@ from __future__ import annotations
 import threading
 from datetime import datetime
 
-from config import EXAM_TYPES
+from config import EXAM_TYPES, CRAWL_TARGETS
 from utils import get_logger, ProgressQueue
 from .bcs_crawler import BCSCrawler
 from .bank_crawler import BankCrawler
 from .ministry_crawler import MinistryCrawler
 from .teacher_crawler import TeacherCrawler
+from .wp_api_crawler import WPAPICrawler
 
 logger = get_logger("crawler_manager")
 
@@ -104,16 +105,32 @@ class CrawlerManager:
 
     def _run_one(self, exam_type: str) -> list[dict]:
         logger.info(f"Running crawler for: {exam_type}")
-        if exam_type == "BCS":
-            return BCSCrawler(self.pq, self.use_playwright).crawl()
-        elif exam_type == "Bank":
-            return BankCrawler(self.pq, self.use_playwright).crawl()
-        elif exam_type == "Ministry":
-            return MinistryCrawler(self.pq, self.use_playwright).crawl()
-        elif exam_type == "Primary Teacher":
-            return TeacherCrawler(self.pq, self.use_playwright).crawl_primary()
-        elif exam_type == "NTRCA":
-            return TeacherCrawler(self.pq, self.use_playwright).crawl_ntrca()
-        else:
+        targets = CRAWL_TARGETS.get(exam_type, [])
+
+        # Route to WP API crawler if all/any targets are wp_api type
+        wp_targets = [t for t in targets if t.get("type") == "wp_api"]
+        html_targets = [t for t in targets if t.get("type") != "wp_api"]
+
+        records: list[dict] = []
+
+        # Run WP API crawler for wp_api targets
+        if wp_targets:
+            records.extend(WPAPICrawler(self.pq).crawl(exam_type, wp_targets))
+
+        # Run legacy HTML crawlers for html targets (if any remain)
+        if html_targets:
+            if exam_type == "BCS":
+                records.extend(BCSCrawler(self.pq, self.use_playwright).crawl())
+            elif exam_type == "Bank":
+                records.extend(BankCrawler(self.pq, self.use_playwright).crawl())
+            elif exam_type == "Ministry":
+                records.extend(MinistryCrawler(self.pq, self.use_playwright).crawl())
+            elif exam_type == "Primary Teacher":
+                records.extend(TeacherCrawler(self.pq, self.use_playwright).crawl_primary())
+            elif exam_type == "NTRCA":
+                records.extend(TeacherCrawler(self.pq, self.use_playwright).crawl_ntrca())
+
+        if not targets:
             logger.warning(f"Unknown exam type: {exam_type}")
-            return []
+
+        return records

@@ -1,97 +1,126 @@
 """
 Bangladesh Govt Jobs Question Bank Crawler
-Streamlit UI — Windows-compatible, no Docker required.
+Streamlit UI — URL-based scraping with MongoDB storage.
 
 Run:  streamlit run app.py
 """
 
 import sys
 import os
+import io
 import json
 import time
 import threading
-from pathlib import Path
+import warnings
 from datetime import datetime
 
-# ── Windows asyncio fix (must be before any asyncio import) ──────────────────
+warnings.filterwarnings("ignore", category=Warning, message=".*urllib3.*")
+
+# ── Windows asyncio fix ───────────────────────────────────────────────────────
 if sys.platform == "win32":
     import asyncio
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+# Fix Unicode output on Windows console
+if sys.stdout and hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 import streamlit as st
 import pandas as pd
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="BD Govt Question Bank",
+    page_title="BD Question Bank Crawler",
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Lazy imports (so Streamlit can start even if deps missing) ────────────────
+# ── Lazy imports ──────────────────────────────────────────────────────────────
 try:
-    from config import (ANTHROPIC_API_KEY, EXAM_TYPES, CRAWL_TARGETS,
-                        AI_MODEL_FAST, AI_MODEL_SMART, PDF_DIR, QUESTIONS_DIR)
-    from crawler import CrawlerManager
-    from processors import AIExtractor, PDFHandler
-    from storage import QuestionStore
-    from utils import ProgressQueue, get_logger
+    from config import (ANTHROPIC_API_KEY, EXAM_TYPES,
+                        AI_MODEL_FAST, AI_MODEL_SMART, PDF_DIR, OUTPUT_DIR)
+    from crawler.url_crawler import URLCrawler
+    from processors.ai_extractor import AIExtractor
+    from processors.pdf_handler import PDFHandler
+    from storage.mongo_store import MongoStore
+    from utils import ProgressQueue
     IMPORTS_OK = True
+    _IMPORT_ERR = ""
 except ImportError as _e:
     IMPORTS_OK = False
     _IMPORT_ERR = str(_e)
 
-# ── Custom CSS ─────────────────────────────────────────────────────────────────
+# ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .main-header { font-size: 2rem; font-weight: 700; color: #006A4E; margin-bottom: 0.2rem; }
-    .sub-header  { color: #888; font-size: 0.9rem; margin-bottom: 1.5rem; }
-    .stat-box    { background: #f0f8f4; border-left: 4px solid #006A4E;
-                   padding: 1rem; border-radius: 6px; margin: 0.5rem 0; }
-    .q-card      { background: #fafafa; border: 1px solid #e0e0e0;
-                   border-radius: 8px; padding: 1rem; margin: 0.8rem 0; }
-    .answer-badge { background: #006A4E; color: white; padding: 2px 8px;
-                    border-radius: 4px; font-size: 0.85rem; font-weight: 600; }
-    .exam-badge  { background: #F42A41; color: white; padding: 2px 8px;
-                   border-radius: 4px; font-size: 0.8rem; }
-    .log-box     { background: #1e1e1e; color: #d4d4d4; font-family: monospace;
-                   font-size: 0.8rem; padding: 1rem; border-radius: 6px;
-                   max-height: 300px; overflow-y: auto; }
+  .main-header { font-size:2rem; font-weight:700; color:#006A4E; margin-bottom:.2rem; }
+  .sub-header  { color:#888; font-size:.9rem; margin-bottom:1.5rem; }
+  .stat-box    { background:#f0f8f4; border-left:4px solid #006A4E;
+                 padding:1rem; border-radius:6px; margin:.5rem 0; text-align:center; }
+  .stat-num    { font-size:1.8rem; font-weight:700; color:#006A4E; }
+  .q-card      { background:#fafafa; border:1px solid #e0e0e0;
+                 border-radius:8px; padding:1rem; margin:.8rem 0; }
+  .answer-badge{ background:#006A4E; color:white; padding:2px 10px;
+                 border-radius:4px; font-size:.85rem; font-weight:600; }
+  .exam-badge  { background:#F42A41; color:white; padding:2px 8px;
+                 border-radius:4px; font-size:.8rem; }
+  .log-box     { background:#1e1e1e; color:#d4d4d4; font-family:monospace;
+                 font-size:.78rem; padding:1rem; border-radius:6px;
+                 max-height:320px; overflow-y:auto; white-space:pre-wrap; }
+  .url-input input { font-size:1rem !important; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── Session state init ────────────────────────────────────────────────────────
-def _init_state():
+# ── Session state ─────────────────────────────────────────────────────────────
+def _init():
     defaults = {
-        "api_key":          ANTHROPIC_API_KEY if IMPORTS_OK else "",
-        "crawl_running":    False,
-        "crawl_done":       False,
-        "progress_pct":     0.0,
-        "progress_msg":     "",
-        "log_lines":        [],
-        "raw_records":      [],
-        "structured_records": [],
-        "pdf_paths":        [],
-        "last_crawl_time":  None,
-        "pq":               None,
-        "manager":          None,
-        "ai_extractor":     None,
-        "ai_model":         AI_MODEL_FAST if IMPORTS_OK else "",
+        "api_key":           ANTHROPIC_API_KEY if IMPORTS_OK else "",
+        "crawl_running":     False,
+        "crawl_done":        False,
+        "progress_pct":      0.0,
+        "progress_msg":      "",
+        "log_lines":         [],
+        "raw_records":       [],
+        "pdf_paths":         [],
+        "image_paths":       [],
+        "last_crawl_url":    "",
+        "last_crawl_time":   "",
+        "pq":                None,
+        "crawl_thread":      None,
+        "crawl_result":      None,   # shared dict filled by background thread
+        "ai_model":          AI_MODEL_FAST if IMPORTS_OK else "",
+        "mongo_ok":          None,   # None = unchecked, True/False after ping
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
-_init_state()
+_init()
+
+
+# ── MongoDB connection check ───────────────────────────────────────────────────
+@st.cache_resource
+def _get_store():
+    if not IMPORTS_OK:
+        return None
+    try:
+        s = MongoStore()
+        ok = s.ping()
+        return s if ok else None
+    except Exception:
+        return None
+
+
+def get_store() -> "MongoStore | None":
+    return _get_store()
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⚙️ Settings")
 
-    # API Key
     api_key_input = st.text_input(
         "Anthropic API Key",
         value=st.session_state.api_key,
@@ -104,55 +133,46 @@ with st.sidebar:
 
     st.divider()
 
-    # Exam type selection
-    st.markdown("### Exam Types")
-    selected_types = []
-    for etype in (EXAM_TYPES if IMPORTS_OK else []):
-        if st.checkbox(etype, value=True, key=f"chk_{etype}"):
-            selected_types.append(etype)
+    # MongoDB status
+    store = get_store()
+    if store is not None:
+        st.success("✅ MongoDB Connected")
+    else:
+        st.error("❌ MongoDB not connected\nCheck MONGODB_DSN in .env")
 
     st.divider()
 
-    # Options
-    st.markdown("### Options")
-    use_playwright = st.toggle("Use Playwright (JS pages)", value=True,
-                               help="Disable if Playwright/Chromium is not installed")
-    download_pdfs  = st.toggle("Download PDFs", value=True,
-                               help="Download PDF question papers found on pages")
-    ai_model_choice = st.selectbox(
-        "AI Model",
+    st.markdown("### AI Model")
+    ai_model = st.selectbox(
+        "Model",
         options=[AI_MODEL_FAST, AI_MODEL_SMART] if IMPORTS_OK else ["—"],
         index=0,
-        help="Fast (Haiku) = cheaper, Smart (Sonnet) = better extraction",
+        help="Haiku = fast & cheap · Sonnet = smarter extraction",
+        label_visibility="collapsed",
     )
     if IMPORTS_OK:
-        st.session_state.ai_model = ai_model_choice
-
-    max_pages = st.slider("Max pages per site", 5, 50, 20, step=5)
+        st.session_state.ai_model = ai_model
 
     st.divider()
 
-    # Crawl button
-    crawl_btn = st.button(
-        "🚀 Start Crawling",
-        disabled=st.session_state.crawl_running or not IMPORTS_OK or not selected_types,
-        use_container_width=True,
-        type="primary",
-    )
-
-    if not IMPORTS_OK:
-        st.error(f"Import error: {_IMPORT_ERR}\nRun setup.bat first.")
+    # Quick stats
+    if store:
+        stats = store.get_stats()
+        st.markdown("### 📊 Database Stats")
+        st.markdown(f"**{stats.get('total_questions', 0):,}** questions stored")
+        st.markdown(f"**{stats.get('total_exams', 0)}** exam records")
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
-st.markdown('<div class="main-header">📚 Bangladesh Govt Question Bank</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Crawl BCS • Bank • Ministry • Primary Teacher • NTRCA exam questions</div>',
-            unsafe_allow_html=True)
-
+st.markdown('<div class="main-header">📚 BD Govt Question Bank Crawler</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="sub-header">Enter any exam question website URL — the crawler extracts MCQs and stores them in MongoDB</div>',
+    unsafe_allow_html=True,
+)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_crawl, tab_browse, tab_search, tab_pdfs, tab_export = st.tabs(
-    ["🕷️ Crawl", "📖 Browse Questions", "🔍 Search", "📄 PDFs", "💾 Export"]
+    ["🕷️ Crawl", "📖 Browse", "🔍 Search", "📄 PDFs & Images", "💾 Export"]
 )
 
 
@@ -160,71 +180,165 @@ tab_crawl, tab_browse, tab_search, tab_pdfs, tab_export = st.tabs(
 # TAB 1 — CRAWL
 # ════════════════════════════════════════════════════════════════════════════
 with tab_crawl:
-    col1, col2, col3, col4 = st.columns(4)
+    if not IMPORTS_OK:
+        st.error(f"Dependency import error: {_IMPORT_ERR}\n\nRun `setup.bat` first.")
+        st.stop()
 
-    store = QuestionStore() if IMPORTS_OK else None
+    # ── Stats row ─────────────────────────────────────────────────────────────
     stats = store.get_stats() if store else {}
-
-    with col1:
-        st.markdown(f'<div class="stat-box"><b>{stats.get("total_exams", 0)}</b><br>Exams Saved</div>',
-                    unsafe_allow_html=True)
-    with col2:
-        st.markdown(f'<div class="stat-box"><b>{stats.get("total_questions", 0)}</b><br>Questions Saved</div>',
-                    unsafe_allow_html=True)
-    with col3:
-        pdf_count = len(list(PDF_DIR.rglob("*.pdf"))) if IMPORTS_OK else 0
-        st.markdown(f'<div class="stat-box"><b>{pdf_count}</b><br>PDFs Downloaded</div>',
-                    unsafe_allow_html=True)
-    with col4:
-        last = st.session_state.last_crawl_time or "Never"
-        st.markdown(f'<div class="stat-box"><b>{last}</b><br>Last Crawl</div>',
-                    unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.markdown(f'<div class="stat-box"><div class="stat-num">{stats.get("total_exams", 0)}</div>Exams Saved</div>', unsafe_allow_html=True)
+    c2.markdown(f'<div class="stat-box"><div class="stat-num">{stats.get("total_questions", 0):,}</div>Questions</div>', unsafe_allow_html=True)
+    c3.markdown(f'<div class="stat-box"><div class="stat-num">{len(list(PDF_DIR.rglob("*.pdf")))}</div>PDFs Downloaded</div>', unsafe_allow_html=True)
+    c4.markdown(f'<div class="stat-box"><div class="stat-num">{st.session_state.last_crawl_time or "—"}</div>Last Crawl</div>', unsafe_allow_html=True)
 
     st.divider()
 
-    # Progress section
-    progress_placeholder = st.empty()
-    progress_bar         = st.empty()
-    log_placeholder      = st.empty()
+    # ── URL input ─────────────────────────────────────────────────────────────
+    st.markdown("### 🌐 Enter Website URL")
+    url_input = st.text_input(
+        "URL",
+        placeholder="https://www.exambd.net/2024/04/45th-bcs-preliminary-question-solution.html",
+        label_visibility="collapsed",
+        key="url_input",
+    )
 
-    # ── Start crawl when button pressed ──────────────────────────────────────
-    if crawl_btn and IMPORTS_OK and selected_types:
+    # ── Options ───────────────────────────────────────────────────────────────
+    st.markdown("### ⚙️ Crawl Options")
+    opt_col1, opt_col2, opt_col3 = st.columns([2, 1, 1])
+
+    with opt_col1:
+        exam_type = st.selectbox(
+            "Exam Type",
+            options=EXAM_TYPES + ["General / Other"],
+            index=0,
+            help="Tag the crawled questions with this exam type",
+        )
+        max_pages = st.slider(
+            "Max pages to crawl",
+            min_value=1, max_value=50, value=10, step=1,
+            help="Number of pages to visit (1 = just the entered URL, more = follow sub-links)",
+        )
+
+    with opt_col2:
+        st.markdown("**Content to scrape**")
+        download_pdfs   = st.checkbox("📄 Download PDFs",   value=True,
+                                       help="Download PDF files found on the page(s)")
+        download_images = st.checkbox("🖼️ Download Images", value=False,
+                                       help="Download images found on the page(s)")
+        use_playwright  = st.checkbox("🎭 Use Playwright",  value=True,
+                                       help="Use browser automation for JS-heavy pages")
+
+    with opt_col3:
+        st.markdown("**AI Processing**")
+        ai_process = st.checkbox("🤖 AI Extract Questions", value=True,
+                                  help="Use Claude to extract structured MCQs from scraped text")
+        st.markdown(f"<small>Model: `{st.session_state.ai_model}`</small>", unsafe_allow_html=True)
+
+    st.divider()
+
+    # ── Start button ──────────────────────────────────────────────────────────
+    can_crawl = bool(url_input and url_input.startswith("http") and
+                     not st.session_state.crawl_running and
+                     store is not None)
+
+    if not store:
+        st.warning("MongoDB is not connected. Cannot start crawl.")
+
+    start_btn = st.button(
+        "🚀 Start Crawling",
+        disabled=not can_crawl,
+        use_container_width=True,
+        type="primary",
+    )
+
+    # ── Progress area ─────────────────────────────────────────────────────────
+    prog_msg   = st.empty()
+    prog_bar   = st.empty()
+    log_area   = st.empty()
+
+    # ── Launch crawl in background thread ─────────────────────────────────────
+    if start_btn and can_crawl:
         if not st.session_state.api_key:
-            st.error("Please enter your Anthropic API Key in the sidebar.")
+            st.error("Enter your Anthropic API Key in the sidebar first.")
         else:
-            # Update config with current API key
             import config as _cfg
             _cfg.ANTHROPIC_API_KEY = st.session_state.api_key
-            _cfg.MAX_PAGES_PER_SITE = max_pages
             os.environ["ANTHROPIC_API_KEY"] = st.session_state.api_key
 
             pq = ProgressQueue()
-            manager = CrawlerManager(
-                progress_queue=pq,
-                exam_types=selected_types,
-                use_playwright=use_playwright,
-                download_pdfs=download_pdfs,
-            )
-            st.session_state.pq             = pq
-            st.session_state.manager        = manager
-            st.session_state.crawl_running  = True
-            st.session_state.crawl_done     = False
-            st.session_state.progress_pct   = 0.0
-            st.session_state.progress_msg   = "Starting..."
-            st.session_state.log_lines      = []
-            st.session_state.raw_records    = []
-            st.session_state.structured_records = []
-            st.session_state.pdf_paths      = []
+            result_holder = {"done": False, "raw_records": [], "pdf_paths": [], "image_paths": []}
 
-            manager.start()
+            def _crawl_job():
+                try:
+                    crawler = URLCrawler(pq, use_playwright=use_playwright)
+                    crawl_out = crawler.crawl(
+                        start_url=url_input,
+                        exam_type=exam_type,
+                        max_pages=max_pages,
+                        download_pdfs=download_pdfs,
+                        download_images=download_images,
+                    )
+                    result_holder["raw_records"]  = crawl_out["raw_records"]
+                    result_holder["pdf_paths"]    = crawl_out["pdf_paths"]
+                    result_holder["image_paths"]  = crawl_out["image_paths"]
+
+                    # AI extraction
+                    if ai_process and crawl_out["raw_records"]:
+                        pq.put("log", "AI", f"Extracting questions from {len(crawl_out['raw_records'])} pages...")
+                        extractor = AIExtractor(pq, model=st.session_state.ai_model)
+                        structured = extractor.extract_batch(crawl_out["raw_records"])
+                        result_holder["structured"] = structured
+                        pq.put("log", "AI", f"Extracted {len(structured)} exam records")
+
+                        # Save to MongoDB
+                        if structured:
+                            _store = MongoStore()
+                            saved_ids = _store.save_batch(structured)
+                            # Save crawl session
+                            _store.save_session({
+                                "url":         url_input,
+                                "exam_type":   exam_type,
+                                "max_pages":   max_pages,
+                                "pages_crawled": len(crawl_out["raw_records"]),
+                                "exams_saved": len(saved_ids),
+                                "questions_saved": sum(
+                                    len(s.get("questions", [])) for s in structured
+                                ),
+                                "pdf_paths":   crawl_out["pdf_paths"],
+                                "image_paths": crawl_out["image_paths"],
+                            })
+                            pq.put("log", "MongoDB", f"Saved {len(saved_ids)} exam records to MongoDB")
+                    else:
+                        result_holder["structured"] = []
+
+                except Exception as exc:
+                    pq.put("error", "Crawler", f"Fatal error: {exc}")
+                    import traceback
+                    pq.put("log", "Crawler", traceback.format_exc())
+                finally:
+                    result_holder["done"] = True
+                    pq.put("done", "Manager", "Crawl job finished")
+
+            t = threading.Thread(target=_crawl_job, daemon=True)
+            t.start()
+
+            st.session_state.pq            = pq
+            st.session_state.crawl_thread  = t
+            st.session_state.crawl_result  = result_holder
+            st.session_state.crawl_running = True
+            st.session_state.crawl_done    = False
+            st.session_state.progress_pct  = 0.0
+            st.session_state.progress_msg  = "Starting..."
+            st.session_state.log_lines     = []
+            st.session_state.last_crawl_url = url_input
             st.rerun()
 
-    # ── Poll loop while crawl is running ─────────────────────────────────────
+    # ── Poll progress while running ───────────────────────────────────────────
     if st.session_state.crawl_running:
-        pq      = st.session_state.pq
-        manager = st.session_state.manager
+        pq     = st.session_state.pq
+        result = st.session_state.crawl_result
 
-        # Drain messages
         if pq:
             for msg in pq.get_all():
                 mtype = msg["type"]
@@ -232,123 +346,95 @@ with tab_crawl:
                 st.session_state.log_lines.append(line)
 
                 if mtype == "progress":
-                    st.session_state.progress_pct = msg["percent"]
+                    st.session_state.progress_pct = msg.get("percent", 0)
                     st.session_state.progress_msg = msg["message"]
-                elif mtype == "error":
-                    st.session_state.log_lines.append(f"  *** ERROR: {msg['message']}")
                 elif mtype == "done":
                     st.session_state.crawl_running = False
                     st.session_state.crawl_done    = True
-                    st.session_state.raw_records   = manager.get_results()
                     st.session_state.last_crawl_time = datetime.now().strftime("%H:%M")
 
-        # Check if manager finished
-        if manager and manager.is_done() and st.session_state.crawl_running:
+        if result and result.get("done") and st.session_state.crawl_running:
             st.session_state.crawl_running = False
             st.session_state.crawl_done    = True
-            st.session_state.raw_records   = manager.get_results()
             st.session_state.last_crawl_time = datetime.now().strftime("%H:%M")
 
-        # Render progress
-        pct = st.session_state.progress_pct / 100
-        progress_placeholder.markdown(f"**{st.session_state.progress_msg}**")
-        progress_bar.progress(min(pct, 1.0))
-
-        log_html = "<br>".join(st.session_state.log_lines[-40:])
-        log_placeholder.markdown(f'<div class="log-box">{log_html}</div>', unsafe_allow_html=True)
+        pct = min(st.session_state.progress_pct / 100, 1.0)
+        prog_msg.markdown(f"⏳ **{st.session_state.progress_msg}**")
+        prog_bar.progress(pct)
+        log_html = "\n".join(st.session_state.log_lines[-50:])
+        log_area.markdown(f'<div class="log-box">{log_html}</div>', unsafe_allow_html=True)
 
         if st.session_state.crawl_running:
             time.sleep(1.5)
             st.rerun()
 
-    # ── Post-crawl: AI processing ─────────────────────────────────────────────
-    if st.session_state.crawl_done and st.session_state.raw_records:
-        raw = st.session_state.raw_records
-        progress_placeholder.success(f"Crawl complete! {len(raw)} raw pages collected.")
-        progress_bar.progress(1.0)
+    # ── Show results after crawl ──────────────────────────────────────────────
+    if st.session_state.crawl_done:
+        result = st.session_state.crawl_result or {}
+        structured = result.get("structured", [])
+        raw = result.get("raw_records", [])
+        pdf_paths = result.get("pdf_paths", [])
+        img_paths = result.get("image_paths", [])
 
-        # AI extraction step
-        with st.spinner(f"AI extracting questions from {len(raw)} pages..."):
-            extractor = AIExtractor(
-                progress_queue=st.session_state.pq,
-                model=st.session_state.ai_model,
-            )
-            structured = extractor.extract_batch(raw)
-            st.session_state.structured_records = structured
-
-            # Save to disk
-            if store and structured:
-                saved_paths = store.save_batch(structured)
-                st.success(f"Saved {len(saved_paths)} exam records to disk.")
-
-        # PDF download step
-        if download_pdfs:
-            all_pdf_urls = []
-            for rec in raw:
-                for pdf_url in rec.get("pdf_links", []):
-                    all_pdf_urls.append((pdf_url, rec.get("exam_type", "misc")))
-
-            if all_pdf_urls:
-                with st.spinner(f"Downloading {len(all_pdf_urls)} PDFs..."):
-                    pdf_handler = PDFHandler(progress_queue=st.session_state.pq)
-                    downloaded = []
-                    for url, etype in all_pdf_urls[:50]:  # cap at 50
-                        p = pdf_handler.download(url, etype)
-                        if p:
-                            downloaded.append(p)
-                    st.session_state.pdf_paths = downloaded
-                    if downloaded:
-                        st.info(f"Downloaded {len(downloaded)} PDFs.")
-                        # Extract text from PDFs and AI-process them too
-                        with st.spinner("Extracting text from PDFs..."):
-                            for pdf_path in downloaded:
-                                pdf_text = pdf_handler.extract_text(pdf_path)
-                                if pdf_text and len(pdf_text) > 100:
-                                    etype = PDFHandler.get_exam_type_from_path(pdf_path)
-                                    pdf_rec = extractor.extract_questions(
-                                        raw_text=pdf_text,
-                                        exam_type=etype,
-                                        source_url=str(pdf_path),
-                                    )
-                                    pdf_rec["pdf_path"] = str(pdf_path)
-                                    if pdf_rec.get("questions"):
-                                        store.save(pdf_rec)
-
+        total_q = sum(len(s.get("questions", [])) for s in structured)
+        prog_msg.success(
+            f"✅ Crawl complete! Pages: {len(raw)} · Exam records: {len(structured)} · "
+            f"Questions: {total_q} · PDFs: {len(pdf_paths)} · Images: {len(img_paths)}"
+        )
+        prog_bar.progress(1.0)
+        log_html = "\n".join(st.session_state.log_lines[-50:])
+        log_area.markdown(f'<div class="log-box">{log_html}</div>', unsafe_allow_html=True)
         st.session_state.crawl_done = False
-        st.rerun()
 
-    # ── Show log if available ─────────────────────────────────────────────────
+    # ── Previous log ─────────────────────────────────────────────────────────
     if st.session_state.log_lines and not st.session_state.crawl_running:
-        with st.expander("View Crawl Log", expanded=False):
-            log_html = "<br>".join(st.session_state.log_lines)
+        with st.expander("📋 Last Crawl Log", expanded=False):
+            log_html = "\n".join(st.session_state.log_lines)
             st.markdown(f'<div class="log-box">{log_html}</div>', unsafe_allow_html=True)
+
+    # ── Recent crawl sessions ─────────────────────────────────────────────────
+    if store:
+        sessions = store.get_recent_sessions(5)
+        if sessions:
+            st.divider()
+            st.markdown("### 🕐 Recent Crawl Sessions")
+            df_s = pd.DataFrame([{
+                "URL":        s.get("url", "")[:60],
+                "Exam Type":  s.get("exam_type", ""),
+                "Pages":      s.get("pages_crawled", 0),
+                "Questions":  s.get("questions_saved", 0),
+                "PDFs":       len(s.get("pdf_paths", [])),
+                "Images":     len(s.get("image_paths", [])),
+                "Time":       str(s.get("created_at", ""))[:16],
+            } for s in sessions])
+            st.dataframe(df_s, use_container_width=True, hide_index=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 2 — BROWSE QUESTIONS
 # ════════════════════════════════════════════════════════════════════════════
 with tab_browse:
-    if not IMPORTS_OK:
-        st.warning("Dependencies not loaded.")
+    store = get_store()
+    if not store:
+        st.warning("MongoDB not connected.")
     else:
-        store = QuestionStore()
         index = store.load_index()
 
         if not index:
             st.info("No questions saved yet. Run a crawl first.")
         else:
-            # Filter controls
-            col_f1, col_f2, col_f3 = st.columns(3)
-            with col_f1:
-                type_filter = st.selectbox("Exam Type", ["All"] + EXAM_TYPES, key="browse_type")
-            with col_f2:
+            # Filter row
+            fc1, fc2, fc3 = st.columns(3)
+            with fc1:
+                all_types = sorted({e.get("exam_type", "") for e in index if e.get("exam_type")})
+                type_filter = st.selectbox("Exam Type", ["All"] + all_types, key="br_type")
+            with fc2:
                 years = sorted({str(e.get("year") or "") for e in index if e.get("year")}, reverse=True)
-                year_filter = st.selectbox("Year", ["All"] + years, key="browse_year")
-            with col_f3:
-                exam_names = sorted({e.get("exam_name", "") for e in index if e.get("exam_name")})
-                name_filter = st.selectbox("Exam Name", ["All"] + exam_names, key="browse_name")
+                year_filter = st.selectbox("Year", ["All"] + years, key="br_year")
+            with fc3:
+                names = sorted({e.get("exam_name", "") for e in index if e.get("exam_name")})
+                name_filter = st.selectbox("Exam Name", ["All"] + names, key="br_name")
 
-            # Apply filters
             filtered = index
             if type_filter != "All":
                 filtered = [e for e in filtered if e.get("exam_type") == type_filter]
@@ -357,51 +443,52 @@ with tab_browse:
             if name_filter != "All":
                 filtered = [e for e in filtered if e.get("exam_name") == name_filter]
 
-            st.markdown(f"**{len(filtered)} exam paper(s) found**")
+            st.markdown(f"**{len(filtered)} exam record(s) found · "
+                        f"{sum(e.get('question_count', 0) for e in filtered)} questions**")
 
             if filtered:
-                # Summary table
                 df = pd.DataFrame([{
-                    "Exam Type":   e.get("exam_type", ""),
-                    "Exam Name":   e.get("exam_name", ""),
-                    "Year":        e.get("year", ""),
-                    "Subject":     e.get("subject", ""),
-                    "Questions":   e.get("question_count", 0),
-                    "Crawled At":  e.get("crawled_at", "")[:16],
+                    "Exam Type": e.get("exam_type", ""),
+                    "Exam Name": e.get("exam_name", ""),
+                    "Year":      e.get("year", ""),
+                    "Subject":   e.get("subject", ""),
+                    "Questions": e.get("question_count", 0),
+                    "Source":    e.get("source_url", "")[:50],
+                    "Crawled":   str(e.get("crawled_at", ""))[:16],
                 } for e in filtered])
                 st.dataframe(df, use_container_width=True, hide_index=True)
 
-                # Drill into individual exam
                 st.divider()
-                selected_exam = st.selectbox(
-                    "View questions from:",
-                    options=[e.get("exam_name") or e.get("exam_id", f"Exam #{i}") for i, e in enumerate(filtered)],
-                    key="browse_exam_select",
+                sel_name = st.selectbox(
+                    "View questions from exam:",
+                    options=[e.get("exam_name") or e.get("exam_id", f"#{i}") for i, e in enumerate(filtered)],
+                    key="br_sel",
                 )
-                sel_idx = next((i for i, e in enumerate(filtered)
-                                if (e.get("exam_name") or e.get("exam_id", f"Exam #{i}")) == selected_exam), None)
-
+                sel_idx = next(
+                    (i for i, e in enumerate(filtered)
+                     if (e.get("exam_name") or e.get("exam_id", f"#{i}")) == sel_name), None
+                )
                 if sel_idx is not None:
-                    sel_entry = filtered[sel_idx]
-                    fp = sel_entry.get("file_path", "")
-                    if fp and Path(fp).exists():
-                        with open(fp, encoding="utf-8") as f:
-                            record = json.load(f)
+                    exam_id = filtered[sel_idx].get("exam_id", "")
+                    record = store.get_exam(exam_id) if exam_id else None
+                    if record:
                         questions = record.get("questions", [])
-                        st.markdown(f"### {record.get('exam_name', 'Questions')} — {len(questions)} questions")
-
+                        st.markdown(f"### {record.get('exam_name', '?')} — {len(questions)} questions")
                         for q in questions:
                             opts = q.get("options", {})
-                            opts_str = "  ".join(f"**{k}.** {v}" for k, v in opts.items()) if opts else ""
+                            opts_str = "&nbsp;&nbsp;".join(
+                                f"<b>{k}.</b> {v}" for k, v in opts.items()
+                            ) if opts else ""
                             topic = q.get("topic", "")
-                            ans   = q.get("answer", "")
+                            expl  = q.get("explanation", "")
                             st.markdown(f"""
 <div class="q-card">
 <b>Q{q.get('q_no', '')}.</b> {q.get('question', '')}
 <br><br>{opts_str}
 <br><br>
-<span class="answer-badge">Ans: {ans}</span>
-{"&nbsp;&nbsp;<small>" + topic + "</small>" if topic else ""}
+<span class="answer-badge">Answer: {q.get('answer', '')}</span>
+{"&nbsp;&nbsp;<small><i>" + topic + "</i></small>" if topic else ""}
+{"<br><small>📝 " + expl + "</small>" if expl else ""}
 </div>
 """, unsafe_allow_html=True)
 
@@ -410,150 +497,155 @@ with tab_browse:
 # TAB 3 — SEARCH
 # ════════════════════════════════════════════════════════════════════════════
 with tab_search:
-    if not IMPORTS_OK:
-        st.warning("Dependencies not loaded.")
+    store = get_store()
+    if not store:
+        st.warning("MongoDB not connected.")
     else:
-        st.markdown("### Search Questions")
-        search_col1, search_col2 = st.columns([3, 1])
-        with search_col1:
-            search_query = st.text_input("Search keyword (English or Bengali)", key="search_q",
-                                         placeholder="e.g.  মুক্তিযুদ্ধ  or  liberation war")
-        with search_col2:
-            search_types = st.multiselect("Exam Types", EXAM_TYPES, default=EXAM_TYPES, key="search_types")
+        st.markdown("### 🔍 Search Questions")
+        sc1, sc2 = st.columns([3, 1])
+        with sc1:
+            q_text = st.text_input(
+                "Search",
+                placeholder="Type in English or Bengali — e.g.  মুক্তিযুদ্ধ  or  liberation war",
+                label_visibility="collapsed",
+                key="srch_q",
+            )
+        with sc2:
+            all_types2 = [e.get("exam_type", "") for e in store.load_index()]
+            all_types2 = sorted(set(t for t in all_types2 if t))
+            srch_types = st.multiselect("Exam Types", all_types2,
+                                         default=all_types2, key="srch_types")
 
-        if search_query:
-            store = QuestionStore()
-            with st.spinner("Searching..."):
-                results = store.search(search_query, exam_types=search_types if search_types else None)
+        if q_text:
+            with st.spinner("Searching MongoDB..."):
+                results = store.search(q_text, exam_types=srch_types or None)
 
             if not results:
                 st.warning("No matching questions found.")
             else:
-                st.success(f"Found {len(results)} matching questions.")
-                for res in results[:50]:
+                st.success(f"Found {len(results)} matching question(s).")
+                for res in results[:60]:
                     q   = res.get("matched_question", {})
                     opts = q.get("options", {})
-                    opts_str = "  ".join(f"**{k}.** {v}" for k, v in opts.items()) if opts else ""
+                    opts_str = "&nbsp;&nbsp;".join(
+                        f"<b>{k}.</b> {v}" for k, v in opts.items()
+                    ) if opts else ""
                     st.markdown(f"""
 <div class="q-card">
-<span class="exam-badge">{res.get("exam_type", "")}</span>
-<small> {res.get("exam_name", "")} {res.get("year", "")}</small>
+<span class="exam-badge">{res.get('exam_type','')}</span>
+<small> {res.get('exam_name','')} {res.get('year','') or ''}</small>
 <br><br>
-<b>Q{q.get('q_no', '')}.</b> {q.get('question', '')}
+<b>Q{q.get('q_no','')}.</b> {q.get('question','')}
 <br><br>{opts_str}
 <br><br>
-<span class="answer-badge">Ans: {q.get('answer', '')}</span>
+<span class="answer-badge">Answer: {q.get('answer','')}</span>
 </div>
 """, unsafe_allow_html=True)
 
-                if len(results) > 50:
-                    st.info(f"Showing 50 of {len(results)} results. Refine your search.")
-
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 4 — PDFs
+# TAB 4 — PDFs & IMAGES
 # ════════════════════════════════════════════════════════════════════════════
 with tab_pdfs:
-    if not IMPORTS_OK:
-        st.warning("Dependencies not loaded.")
+    st.markdown("### 📄 Downloaded PDFs")
+    all_pdfs = list(PDF_DIR.rglob("*.pdf")) if IMPORTS_OK else []
+    if not all_pdfs:
+        st.info("No PDFs downloaded yet. Enable 'Download PDFs' when crawling.")
     else:
-        st.markdown("### Downloaded PDF Question Papers")
+        st.success(f"{len(all_pdfs)} PDF file(s)")
+        by_type: dict = {}
+        for p in all_pdfs:
+            etype = p.parent.name.replace("_", " ")
+            by_type.setdefault(etype, []).append(p)
+        for etype, pdfs in sorted(by_type.items()):
+            with st.expander(f"**{etype}** — {len(pdfs)} file(s)"):
+                for pdf in sorted(pdfs, key=lambda x: x.name):
+                    ca, cb, cc = st.columns([4, 1, 1])
+                    size_kb = pdf.stat().st_size // 1024
+                    ca.markdown(f"📄 **{pdf.name}** `{size_kb} KB`")
+                    with open(pdf, "rb") as fh:
+                        cb.download_button("⬇ Download", data=fh, file_name=pdf.name,
+                                           mime="application/pdf", key=f"dl_{pdf.stem}")
+                    if cc.button("Preview", key=f"pv_{pdf.stem}"):
+                        handler = PDFHandler()
+                        txt = handler.extract_text(pdf)
+                        st.text_area("Text", txt[:3000], height=250, key=f"ta_{pdf.stem}")
 
-        all_pdfs = list(PDF_DIR.rglob("*.pdf"))
-        if not all_pdfs:
-            st.info("No PDFs downloaded yet. Enable 'Download PDFs' and run a crawl.")
-        else:
-            st.success(f"{len(all_pdfs)} PDF(s) available")
-
-            # Group by exam type
-            by_type: dict[str, list[Path]] = {}
-            for p in all_pdfs:
-                etype = p.parent.name.replace("_", " ")
-                by_type.setdefault(etype, []).append(p)
-
-            for etype, pdfs in sorted(by_type.items()):
-                with st.expander(f"**{etype}** — {len(pdfs)} file(s)"):
-                    for pdf in sorted(pdfs, key=lambda x: x.name):
-                        col_a, col_b, col_c = st.columns([4, 1, 1])
-                        size_kb = pdf.stat().st_size // 1024
-                        with col_a:
-                            st.markdown(f"📄 **{pdf.name}** `{size_kb} KB`")
-                        with col_b:
-                            with open(pdf, "rb") as fh:
-                                st.download_button(
-                                    "Download",
-                                    data=fh,
-                                    file_name=pdf.name,
-                                    mime="application/pdf",
-                                    key=f"dl_{pdf.stem}",
-                                )
-                        with col_c:
-                            if st.button("Preview Text", key=f"prev_{pdf.stem}"):
-                                handler = PDFHandler()
-                                text = handler.extract_text(pdf)
-                                st.text_area("PDF Text", text[:3000], height=300, key=f"ta_{pdf.stem}")
+    st.divider()
+    st.markdown("### 🖼️ Downloaded Images")
+    img_root = OUTPUT_DIR / "images" if IMPORTS_OK else None
+    all_imgs = list(img_root.rglob("*.*")) if (img_root and img_root.exists()) else []
+    img_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+    all_imgs = [p for p in all_imgs if p.suffix.lower() in img_exts]
+    if not all_imgs:
+        st.info("No images downloaded yet. Enable 'Download Images' when crawling.")
+    else:
+        st.success(f"{len(all_imgs)} image(s) downloaded")
+        cols = st.columns(5)
+        for i, img in enumerate(all_imgs[:50]):
+            with cols[i % 5]:
+                try:
+                    st.image(str(img), caption=img.name[:20], use_container_width=True)
+                except Exception:
+                    st.markdown(f"📎 {img.name}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 5 — EXPORT
 # ════════════════════════════════════════════════════════════════════════════
 with tab_export:
-    if not IMPORTS_OK:
-        st.warning("Dependencies not loaded.")
+    store = get_store()
+    if not store:
+        st.warning("MongoDB not connected.")
     else:
-        st.markdown("### Export Question Bank as JSON")
-        store = QuestionStore()
         stats = store.get_stats()
 
-        # Stats display
-        col_e1, col_e2 = st.columns(2)
-        with col_e1:
+        ec1, ec2 = st.columns(2)
+        with ec1:
             st.markdown("**Questions by Exam Type**")
             if stats.get("by_exam_type"):
-                df_type = pd.DataFrame(
-                    stats["by_exam_type"].items(),
-                    columns=["Exam Type", "Questions"]
+                df_t = pd.DataFrame(
+                    stats["by_exam_type"].items(), columns=["Exam Type", "Questions"]
                 ).sort_values("Questions", ascending=False)
-                st.dataframe(df_type, use_container_width=True, hide_index=True)
+                st.dataframe(df_t, use_container_width=True, hide_index=True)
             else:
                 st.info("No data yet.")
-
-        with col_e2:
+        with ec2:
             st.markdown("**Questions by Year**")
             if stats.get("by_year"):
-                df_year = pd.DataFrame(
-                    stats["by_year"].items(),
-                    columns=["Year", "Questions"]
+                df_y = pd.DataFrame(
+                    stats["by_year"].items(), columns=["Year", "Questions"]
                 ).head(15)
-                st.dataframe(df_year, use_container_width=True, hide_index=True)
+                st.dataframe(df_y, use_container_width=True, hide_index=True)
 
         st.divider()
         st.markdown("### Download JSON")
 
-        exp_col1, exp_col2 = st.columns(2)
-        with exp_col1:
-            st.markdown("**Export all exam types**")
-            if st.button("Prepare Full Export", key="export_all"):
-                with st.spinner("Preparing..."):
+        ex1, ex2 = st.columns(2)
+        with ex1:
+            st.markdown("**Export all**")
+            if st.button("Prepare Full Export", key="exp_all"):
+                with st.spinner("Loading from MongoDB..."):
                     data = store.export_all_json()
                 st.download_button(
-                    "Download all_questions.json",
+                    "⬇ all_questions.json",
                     data=data.encode("utf-8"),
                     file_name=f"all_questions_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
                     mime="application/json",
                     key="dl_all",
                 )
-
-        with exp_col2:
+        with ex2:
             st.markdown("**Export by exam type**")
-            etype_exp = st.selectbox("Select type", EXAM_TYPES, key="exp_type")
-            if st.button(f"Prepare {etype_exp} Export", key="export_type"):
-                with st.spinner("Preparing..."):
-                    data = store.export_by_type(etype_exp)
-                st.download_button(
-                    f"Download {etype_exp.replace(' ', '_')}_questions.json",
-                    data=data.encode("utf-8"),
-                    file_name=f"{etype_exp.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.json",
-                    mime="application/json",
-                    key="dl_type",
-                )
+            all_types3 = sorted({e.get("exam_type", "") for e in store.load_index() if e.get("exam_type")})
+            if all_types3:
+                etype_exp = st.selectbox("Type", all_types3, key="exp_type")
+                if st.button(f"Prepare {etype_exp}", key="exp_type_btn"):
+                    with st.spinner("Loading..."):
+                        data = store.export_by_type(etype_exp)
+                    st.download_button(
+                        f"⬇ {etype_exp.replace(' ','_')}.json",
+                        data=data.encode("utf-8"),
+                        file_name=f"{etype_exp.replace(' ','_')}_{datetime.now().strftime('%Y%m%d')}.json",
+                        mime="application/json",
+                        key="dl_type",
+                    )

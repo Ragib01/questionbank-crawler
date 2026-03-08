@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 import re
-from urllib.parse import urljoin
-
-from bs4 import BeautifulSoup
 
 from config import CRAWL_TARGETS, MAX_PAGES_PER_SITE
 from utils import get_logger, ProgressQueue
 from .base_crawler import BaseCrawler, PageResult
 
 logger = get_logger("ministry_crawler")
+
+ARTICLE_URL_RE = re.compile(
+    r"/(20\d{2}/\d{2}/|ministry[-/]|question[-/]|exam[-/]|solution[-/]|job[-/]|circular[-/]|niyog[-/])",
+    re.I,
+)
 
 
 class MinistryCrawler:
@@ -27,7 +29,6 @@ class MinistryCrawler:
 
         records: list[dict] = []
         total = len(targets)
-
         for idx, target in enumerate(targets, 1):
             self.pq.put("progress", self.EXAM_TYPE,
                         f"Crawling: {target['name']} ({idx}/{total})",
@@ -39,7 +40,7 @@ class MinistryCrawler:
                 self.pq.put("log", self.EXAM_TYPE,
                             f"  Found {len(page_records)} pages from {target['name']}")
             except Exception as exc:
-                logger.error(f"[Ministry] Error: {target['name']}: {exc}")
+                logger.error(f"[Ministry] Error: {exc}")
                 self.pq.put("error", self.EXAM_TYPE, f"Error: {target['name']} — {exc}")
 
         self.pq.put("log", self.EXAM_TYPE, f"Ministry crawl done. Total raw pages: {len(records)}")
@@ -51,33 +52,22 @@ class MinistryCrawler:
         if not index_result.success:
             return records
 
-        if len(index_result.markdown) > 200:
+        sub_links = self.base.get_same_domain_links(
+            index_result.html, target["url"], filter_pattern=ARTICLE_URL_RE.pattern
+        )
+
+        if len(index_result.markdown) > 300:
             records.append(self._make_record(target, index_result))
 
-        sub_links = self._find_question_links(index_result.html, target["url"])
-        logger.info(f"[Ministry] Found {len(sub_links)} links on {target['name']}")
-
+        logger.info(f"[Ministry] Found {len(sub_links)} article links on {target['name']}")
         for i, link in enumerate(sub_links[:MAX_PAGES_PER_SITE], 1):
-            self.pq.put("log", self.EXAM_TYPE, f"  Fetching {i}/{min(len(sub_links), MAX_PAGES_PER_SITE)}: {link}")
+            self.pq.put("log", self.EXAM_TYPE,
+                        f"  [{i}/{min(len(sub_links), MAX_PAGES_PER_SITE)}] {link}")
             result = self.base.fetch(link)
-            if result.success and len(result.markdown) > 100:
+            if result.success and len(result.markdown) > 200:
                 records.append(self._make_record(target, result))
 
         return records
-
-    def _find_question_links(self, html: str, base_url: str) -> list[str]:
-        soup = BeautifulSoup(html, "lxml")
-        links = []
-        keywords = ["ministry", "question", "exam", "circular", "job", "paper",
-                    "mcq", "written", "recruitment", "নিয়োগ", "প্রশ্ন"]
-        for tag in soup.find_all("a", href=True):
-            href = tag["href"].strip()
-            text = tag.get_text(strip=True).lower()
-            full_url = urljoin(base_url, href)
-            if any(kw in full_url.lower() or kw in text for kw in keywords):
-                if full_url not in links and not full_url.endswith((".jpg", ".png", ".gif")):
-                    links.append(full_url)
-        return links
 
     def _make_record(self, target: dict, result: PageResult) -> dict:
         year = self._extract_year(result.url + " " + result.markdown[:500])
@@ -93,5 +83,5 @@ class MinistryCrawler:
 
     @staticmethod
     def _extract_year(text: str) -> int | None:
-        match = re.search(r"\b(19|20)\d{2}\b", text)
+        match = re.search(r"\b(20\d{2})\b", text)
         return int(match.group()) if match else None

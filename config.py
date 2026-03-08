@@ -42,118 +42,119 @@ HEADERS = {
 EXAM_TYPES = ["BCS", "Bank", "Ministry", "Primary Teacher", "NTRCA"]
 
 # ── Crawl Targets ──────────────────────────────────────────────────────────────
-# Each entry: name, url, type (html | pdf_index), exam_type, pdf_patterns (optional)
+# Source: pdf.exambd.net (WordPress site with REST API)
+# Category IDs: mcq-corner=23, daily-gk=20, monthly-gk=26, general-knowledge=19,
+#               job-solution-pdf=11, job-question=41, daily-exam=69
+#
+# type="wp_api"  → uses WPAPICrawler (WordPress REST API)
+# type="html"    → uses domain-specific HTML crawlers (legacy)
+
+EXAMBD_PDF_BASE = "https://pdf.exambd.net"
+
 CRAWL_TARGETS = {
+    # BCS pulls from MCQ Corner (structured MCQ) + Monthly GK (comprehensive sets)
     "BCS": [
         {
-            "name": "BPSC Official Question Papers",
-            "url": "https://www.bpsc.gov.bd/site/page/b0e2c6d9-e21e-40c4-a823-3a86c041c5e2/-",
-            "type": "html",
-            "notes": "Official BPSC question archive",
+            "name": "MCQ Corner — Current Affairs MCQ",
+            "base_url": EXAMBD_PDF_BASE,
+            "type": "wp_api",
+            "category_id": 23,   # mcq-corner — daily/weekly/monthly MCQ posts
+            "per_page": 10,
+            "max_pages": 3,
+            "notes": "MCQ posts with a/b/c/d options and answers",
         },
         {
-            "name": "BCS Question Bank (ExamBD)",
-            "url": "https://www.exambd.net/bcs/",
-            "type": "html",
-            "notes": "BCS exam question archive",
-        },
-        {
-            "name": "BCS Preliminary Questions (StudyPress)",
-            "url": "https://studypress.net/bcs-question-bank/",
-            "type": "html",
-            "notes": "BCS question bank",
-        },
-        {
-            "name": "BCS Questions (BD Jobs Today)",
-            "url": "https://www.bdjobstoday.info/category/bcs-question/",
-            "type": "html",
-            "notes": "BCS question papers",
-        },
-        {
-            "name": "Satt Academy BCS",
-            "url": "https://sattacademy.com/job-solution/bcs",
-            "type": "html",
-            "notes": "BCS solution archive",
+            "name": "Monthly GK — Comprehensive MCQ",
+            "base_url": EXAMBD_PDF_BASE,
+            "type": "wp_api",
+            "category_id": 26,   # monthly-gk
+            "per_page": 5,
+            "max_pages": 2,
+            "notes": "Monthly comprehensive MCQ/GK posts",
         },
     ],
+    # Bank pulls from Job Question category (actual job solution posts) + MCQ Corner
     "Bank": [
         {
-            "name": "Bangladesh Bank Recruitment",
-            "url": "https://erecruitment.bb.org.bd/",
-            "type": "html",
-            "notes": "Bangladesh Bank official recruitment",
+            "name": "Job Question — Bank Solutions",
+            "base_url": EXAMBD_PDF_BASE,
+            "type": "wp_api",
+            "category_id": 41,   # job-question
+            "per_page": 5,
+            "max_pages": 2,
+            "notes": "Bank job solution posts",
         },
         {
-            "name": "Bank Exam Questions (ExamBD)",
-            "url": "https://www.exambd.net/bank/",
-            "type": "html",
-            "notes": "Bank job exam questions",
-        },
-        {
-            "name": "Bank MCQ (BD Jobs Today)",
-            "url": "https://www.bdjobstoday.info/category/bank-question/",
-            "type": "html",
-            "notes": "Bank exam question papers",
+            "name": "MCQ Corner — Current Affairs",
+            "base_url": EXAMBD_PDF_BASE,
+            "type": "wp_api",
+            "category_id": 23,   # mcq-corner
+            "per_page": 8,
+            "max_pages": 2,
+            "notes": "MCQ questions relevant for bank exams",
         },
     ],
+    # Ministry pulls from General Knowledge + MCQ Corner
     "Ministry": [
         {
-            "name": "BPSC Non-Cadre / Ministry",
-            "url": "https://www.bpsc.gov.bd/site/view/noncadre_job_circular",
-            "type": "html",
-            "notes": "Ministry and govt dept exam questions",
+            "name": "General Knowledge — Q&A",
+            "base_url": EXAMBD_PDF_BASE,
+            "type": "wp_api",
+            "category_id": 19,   # general-knowledge
+            "per_page": 8,
+            "max_pages": 2,
+            "notes": "GK Q&A posts relevant for ministry exams",
         },
         {
-            "name": "Ministry Questions (ExamBD)",
-            "url": "https://www.exambd.net/ministry/",
-            "type": "html",
-            "notes": "Govt ministry exam questions",
-        },
-        {
-            "name": "Ministry Jobs (BD Jobs Today)",
-            "url": "https://www.bdjobstoday.info/category/ministry-question/",
-            "type": "html",
-            "notes": "Ministry job question papers",
+            "name": "MCQ Corner — Current Affairs",
+            "base_url": EXAMBD_PDF_BASE,
+            "type": "wp_api",
+            "category_id": 23,   # mcq-corner
+            "per_page": 8,
+            "max_pages": 2,
+            "notes": "MCQ questions for ministry exams",
         },
     ],
+    # Primary Teacher pulls from Daily GK + MCQ Corner
     "Primary Teacher": [
         {
-            "name": "DPE Official",
-            "url": "https://dpe.gov.bd/",
-            "type": "html",
-            "notes": "Directorate of Primary Education",
+            "name": "Daily GK — Q&A",
+            "base_url": EXAMBD_PDF_BASE,
+            "type": "wp_api",
+            "category_id": 20,   # daily-gk
+            "per_page": 8,
+            "max_pages": 2,
+            "notes": "Daily GK Q&A for primary teacher prep",
         },
         {
-            "name": "Primary Teacher Questions (ExamBD)",
-            "url": "https://www.exambd.net/primary/",
-            "type": "html",
-            "notes": "Primary teacher exam questions",
-        },
-        {
-            "name": "Primary Exam (BD Jobs Today)",
-            "url": "https://www.bdjobstoday.info/category/primary-question/",
-            "type": "html",
-            "notes": "Primary teacher question papers",
+            "name": "MCQ Corner — Current Affairs",
+            "base_url": EXAMBD_PDF_BASE,
+            "type": "wp_api",
+            "category_id": 23,   # mcq-corner
+            "per_page": 8,
+            "max_pages": 2,
+            "notes": "MCQ questions for primary teacher exams",
         },
     ],
+    # NTRCA pulls from Job Question + Daily GK
     "NTRCA": [
         {
-            "name": "NTRCA Official",
-            "url": "https://ntrca.gov.bd/",
-            "type": "html",
-            "notes": "NTRCA official site",
+            "name": "Job Question — NTRCA Solutions",
+            "base_url": EXAMBD_PDF_BASE,
+            "type": "wp_api",
+            "category_id": 41,   # job-question
+            "per_page": 5,
+            "max_pages": 2,
+            "notes": "NTRCA job solution posts",
         },
         {
-            "name": "NTRCA Questions (ExamBD)",
-            "url": "https://www.exambd.net/ntrca/",
-            "type": "html",
-            "notes": "NTRCA exam questions",
-        },
-        {
-            "name": "NTRCA Question Papers (BD Jobs Today)",
-            "url": "https://www.bdjobstoday.info/category/ntrca-question/",
-            "type": "html",
-            "notes": "NTRCA question papers",
+            "name": "Daily GK — Q&A",
+            "base_url": EXAMBD_PDF_BASE,
+            "type": "wp_api",
+            "category_id": 20,   # daily-gk
+            "per_page": 8,
+            "max_pages": 2,
+            "notes": "Daily GK Q&A for NTRCA prep",
         },
     ],
 }

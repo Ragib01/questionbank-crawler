@@ -10,8 +10,11 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 
+import urllib3
 import requests
 import pdfplumber
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from config import PDF_DIR, HEADERS, MAX_PDF_SIZE_MB, REQUEST_TIMEOUT_SEC, REQUEST_DELAY_SEC
 from utils import get_logger, ProgressQueue
@@ -45,8 +48,15 @@ class PDFHandler:
             except Exception:
                 pass  # HEAD not always supported — continue
 
-            resp = self.session.get(url, timeout=REQUEST_TIMEOUT_SEC, stream=True)
+            resp = self.session.get(url, timeout=REQUEST_TIMEOUT_SEC, stream=True, verify=False)
             resp.raise_for_status()
+
+            # Verify it's actually a PDF via Content-Type header
+            content_type = resp.headers.get("Content-Type", "").lower()
+            if "pdf" not in content_type and "octet-stream" not in content_type:
+                logger.debug(f"Skipping non-PDF response ({content_type}): {url}")
+                return None
+
 
             # Determine save path
             save_dir = PDF_DIR / exam_type.replace(" ", "_")
