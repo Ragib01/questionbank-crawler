@@ -6,6 +6,7 @@ Windows-compatible async setup included.
 
 import asyncio
 import sys
+import threading
 import time
 import re
 import warnings
@@ -75,12 +76,19 @@ class BaseCrawler:
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def fetch(self, url: str) -> PageResult:
-        """Sync wrapper — always safe to call."""
+        """Sync wrapper — always safe to call from any thread."""
         if self.use_playwright:
-            try:
-                return asyncio.run(self._fetch_playwright(url))
-            except Exception as exc:
-                logger.warning(f"Playwright fetch failed ({exc}), falling back to requests.")
+            # asyncio.run() + Playwright subprocess spawning is unreliable in
+            # non-main threads on Windows (ProactorEventLoop / process_title assert).
+            # Skip Playwright in worker threads and use requests directly.
+            in_main = threading.current_thread() is threading.main_thread()
+            if in_main:
+                try:
+                    return asyncio.run(self._fetch_playwright(url))
+                except Exception as exc:
+                    logger.warning(f"Playwright fetch failed ({exc}), falling back to requests.")
+            else:
+                logger.debug("Worker thread — using requests fallback (Playwright skipped).")
         return self._fetch_requests(url)
 
     async def fetch_async(self, url: str) -> PageResult:

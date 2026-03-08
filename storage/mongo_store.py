@@ -35,8 +35,9 @@ class MongoStore:
         self.client = _get_client()
         db_name = os.getenv("MONGODB_DATABASE_QB", "questionbank")
         self.db = self.client[db_name]
-        self.exams = self.db["exams"]
-        self.sessions = self.db["crawl_sessions"]
+        self.exams     = self.db["exams"]
+        self.sessions  = self.db["crawl_sessions"]
+        self.watchlist = self.db["url_watchlist"]
         self._ensure_indexes()
 
     # ── Connection check ───────────────────────────────────────────────────────
@@ -181,6 +182,43 @@ class MongoStore:
         docs = self.load_all(exam_type=exam_type)
         return json.dumps(docs, ensure_ascii=False, indent=2, default=str)
 
+    # ── URL Watchlist ──────────────────────────────────────────────────────────
+
+    def watchlist_add(self, url: str, exam_type: str = "General") -> None:
+        """Add a URL to the watchlist (ignored if already present)."""
+        self.watchlist.update_one(
+            {"url": url},
+            {"$setOnInsert": {
+                "url":            url,
+                "exam_type":      exam_type,
+                "added_at":       datetime.utcnow(),
+                "last_crawled_at": None,
+                "crawl_count":    0,
+                "questions_saved": 0,
+            }},
+            upsert=True,
+        )
+
+    def watchlist_mark_crawled(self, url: str, questions_saved: int = 0) -> None:
+        """Update crawl timestamp and question count for a watchlist entry."""
+        self.watchlist.update_one(
+            {"url": url},
+            {"$set":  {"last_crawled_at": datetime.utcnow(),
+                        "questions_saved":  questions_saved},
+             "$inc":  {"crawl_count": 1}},
+            upsert=True,
+        )
+
+    def watchlist_remove(self, url: str) -> None:
+        self.watchlist.delete_one({"url": url})
+
+    def watchlist_get(self) -> list[dict]:
+        """Return all watchlist entries sorted: pending first, then by added_at desc."""
+        docs = list(self.watchlist.find({}, {"_id": 0}).sort(
+            [("last_crawled_at", 1), ("added_at", -1)]
+        ))
+        return docs
+
     # ── Recent sessions ────────────────────────────────────────────────────────
 
     def get_recent_sessions(self, limit: int = 10) -> list[dict]:
@@ -196,6 +234,7 @@ class MongoStore:
             self.exams.create_index("exam_id", unique=True, background=True)
             self.exams.create_index("exam_type", background=True)
             self.exams.create_index("crawled_at", background=True)
+            self.watchlist.create_index("url", unique=True, background=True)
         except Exception as exc:
             logger.warning(f"Index creation warning: {exc}")
 

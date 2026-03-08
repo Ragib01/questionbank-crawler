@@ -7,7 +7,6 @@ Run:  streamlit run app.py
 
 import sys
 import os
-import io
 import json
 import time
 import threading
@@ -20,10 +19,6 @@ warnings.filterwarnings("ignore", category=Warning, message=".*urllib3.*")
 if sys.platform == "win32":
     import asyncio
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-# Fix Unicode output on Windows console
-if sys.stdout and hasattr(sys.stdout, "buffer"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 import streamlit as st
 import pandas as pd
@@ -108,7 +103,13 @@ def _get_store():
     try:
         s = MongoStore()
         ok = s.ping()
-        return s if ok else None
+        if not ok:
+            return None
+        # Bust cache if the store is missing new methods (stale cached instance)
+        if not hasattr(s, "watchlist_get"):
+            _get_store.clear()
+            s = MongoStore()
+        return s
     except Exception:
         return None
 
@@ -153,6 +154,10 @@ with st.sidebar:
     if IMPORTS_OK:
         st.session_state.ai_model = ai_model
 
+    if st.button("🔄 Reconnect DB", help="Clear cached connection and reconnect"):
+        _get_store.clear()
+        st.rerun()
+
     st.divider()
 
     # Quick stats
@@ -171,8 +176,8 @@ st.markdown(
 )
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_crawl, tab_browse, tab_search, tab_pdfs, tab_export = st.tabs(
-    ["🕷️ Crawl", "📖 Browse", "🔍 Search", "📄 PDFs & Images", "💾 Export"]
+tab_crawl, tab_watchlist, tab_browse, tab_search, tab_pdfs, tab_export = st.tabs(
+    ["🕷️ Crawl", "🗂️ Watchlist", "📖 Browse", "🔍 Search", "📄 PDFs & Images", "💾 Export"]
 )
 
 
@@ -266,56 +271,89 @@ with tab_crawl:
             _cfg.ANTHROPIC_API_KEY = st.session_state.api_key
             os.environ["ANTHROPIC_API_KEY"] = st.session_state.api_key
 
+            # Add URL to watchlist (so it gets marked when done)
+            try:
+                _wl_store = MongoStore()
+                _wl_store.watchlist_add(url_input, exam_type)
+            except Exception:
+                pass
+
             pq = ProgressQueue()
-            result_holder = {"done": False, "raw_records": [], "pdf_paths": [], "image_paths": []}
+            result_holder = {"done": False, "raw_records": [], "pdf_paths": [], "image_paths": [], "structured": []}
+
+            # Capture all session-state values NOW (before the thread starts).
+            # st.session_state is NOT thread-safe — accessing it inside the
+            # background thread raises errors and silently kills AI + MongoDB save.
+            _ai_model   = st.session_state.ai_model
+            _api_key    = st.session_state.api_key
+
+            # Snapshot all widget values too (closures capture mutable references)
+            _url         = url_input
+            _exam_type   = exam_type
+            _max_pages   = max_pages
+            _dl_pdfs     = download_pdfs
+            _dl_images   = download_images
+            _use_pw      = use_playwright
+            _ai_process  = ai_process
 
             def _crawl_job():
+                import traceback as _tb
                 try:
-                    crawler = URLCrawler(pq, use_playwright=use_playwright)
+                    # Set API key in environment for this thread
+                    os.environ["ANTHROPIC_API_KEY"] = _api_key
+
+                    crawler = URLCrawler(pq, use_playwright=_use_pw)
                     crawl_out = crawler.crawl(
-                        start_url=url_input,
-                        exam_type=exam_type,
-                        max_pages=max_pages,
-                        download_pdfs=download_pdfs,
-                        download_images=download_images,
+                        start_url=_url,
+                        exam_type=_exam_type,
+                        max_pages=_max_pages,
+                        download_pdfs=_dl_pdfs,
+                        download_images=_dl_images,
                     )
                     result_holder["raw_records"]  = crawl_out["raw_records"]
                     result_holder["pdf_paths"]    = crawl_out["pdf_paths"]
                     result_holder["image_paths"]  = crawl_out["image_paths"]
 
                     # AI extraction
-                    if ai_process and crawl_out["raw_records"]:
-                        pq.put("log", "AI", f"Extracting questions from {len(crawl_out['raw_records'])} pages...")
-                        extractor = AIExtractor(pq, model=st.session_state.ai_model)
+                    if _ai_process and crawl_out["raw_records"]:
+                        pq.put("log", "AI",
+                               f"Extracting questions from {len(crawl_out['raw_records'])} pages...")
+                        extractor = AIExtractor(pq, model=_ai_model)
                         structured = extractor.extract_batch(crawl_out["raw_records"])
                         result_holder["structured"] = structured
-                        pq.put("log", "AI", f"Extracted {len(structured)} exam records")
+                        total_q = sum(len(s.get("questions", [])) for s in structured)
+                        pq.put("log", "AI",
+                               f"Extracted {len(structured)} records, {total_q} questions total")
 
                         # Save to MongoDB
                         if structured:
+                            pq.put("log", "MongoDB", "Saving to MongoDB...")
                             _store = MongoStore()
                             saved_ids = _store.save_batch(structured)
-                            # Save crawl session
                             _store.save_session({
-                                "url":         url_input,
-                                "exam_type":   exam_type,
-                                "max_pages":   max_pages,
-                                "pages_crawled": len(crawl_out["raw_records"]),
-                                "exams_saved": len(saved_ids),
-                                "questions_saved": sum(
-                                    len(s.get("questions", [])) for s in structured
-                                ),
-                                "pdf_paths":   crawl_out["pdf_paths"],
-                                "image_paths": crawl_out["image_paths"],
+                                "url":             _url,
+                                "exam_type":       _exam_type,
+                                "max_pages":       _max_pages,
+                                "pages_crawled":   len(crawl_out["raw_records"]),
+                                "exams_saved":     len(saved_ids),
+                                "questions_saved": total_q,
+                                "pdf_paths":       crawl_out["pdf_paths"],
+                                "image_paths":     crawl_out["image_paths"],
                             })
-                            pq.put("log", "MongoDB", f"Saved {len(saved_ids)} exam records to MongoDB")
+                            _store.watchlist_mark_crawled(_url, questions_saved=total_q)
+                            pq.put("log", "MongoDB",
+                                   f"✅ Saved {len(saved_ids)} exam records ({total_q} questions)")
+                        else:
+                            pq.put("log", "AI", "⚠️ No structured records to save — no questions extracted")
                     else:
-                        result_holder["structured"] = []
+                        if not _ai_process:
+                            pq.put("log", "AI", "AI processing skipped (checkbox unchecked)")
+                        else:
+                            pq.put("log", "AI", "⚠️ No raw records to process")
 
                 except Exception as exc:
                     pq.put("error", "Crawler", f"Fatal error: {exc}")
-                    import traceback
-                    pq.put("log", "Crawler", traceback.format_exc())
+                    pq.put("log", "Crawler", _tb.format_exc())
                 finally:
                     result_holder["done"] = True
                     pq.put("done", "Manager", "Crawl job finished")
@@ -411,7 +449,114 @@ with tab_crawl:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 2 — BROWSE QUESTIONS
+# TAB 2 — URL WATCHLIST
+# ════════════════════════════════════════════════════════════════════════════
+with tab_watchlist:
+    store = get_store()
+    if not store:
+        st.warning("MongoDB not connected.")
+    else:
+        st.markdown("### 🗂️ URL Watchlist")
+        st.markdown(
+            "Track which URLs have been scraped and which are still pending. "
+            "Add any URL here — it will be marked ✅ Done automatically when crawled."
+        )
+
+        # ── Add URL form ──────────────────────────────────────────────────
+        with st.form("wl_add_form", clear_on_submit=True):
+            wl_col1, wl_col2, wl_col3 = st.columns([4, 2, 1])
+            with wl_col1:
+                wl_url = st.text_input(
+                    "URL",
+                    placeholder="https://pdf.exambd.net/...",
+                    label_visibility="collapsed",
+                )
+            with wl_col2:
+                wl_type = st.selectbox(
+                    "Exam Type",
+                    options=EXAM_TYPES + ["General / Other"] if IMPORTS_OK else ["General / Other"],
+                    label_visibility="collapsed",
+                )
+            with wl_col3:
+                wl_submit = st.form_submit_button("➕ Add", use_container_width=True)
+
+        if wl_submit and wl_url and wl_url.startswith("http"):
+            store.watchlist_add(wl_url.strip(), wl_type)
+            st.success(f"Added to watchlist: {wl_url[:70]}")
+            st.rerun()
+        elif wl_submit:
+            st.warning("Enter a valid URL starting with http.")
+
+        st.divider()
+
+        # ── Load and display watchlist ────────────────────────────────────
+        wl_entries = store.watchlist_get()
+
+        if not wl_entries:
+            st.info("Watchlist is empty. Add URLs above or start a crawl — URLs are added automatically.")
+        else:
+            pending = [e for e in wl_entries if not e.get("last_crawled_at")]
+            done    = [e for e in wl_entries if e.get("last_crawled_at")]
+
+            st.markdown(
+                f"**{len(wl_entries)} URL(s) total · "
+                f"⏳ {len(pending)} pending · "
+                f"✅ {len(done)} done**"
+            )
+
+            # ── Summary table ─────────────────────────────────────────────
+            rows = []
+            for e in wl_entries:
+                crawled = e.get("last_crawled_at")
+                rows.append({
+                    "Status":        "✅ Done" if crawled else "⏳ Pending",
+                    "URL":           e.get("url", ""),
+                    "Exam Type":     e.get("exam_type", ""),
+                    "Questions":     e.get("questions_saved", 0),
+                    "Crawl Count":   e.get("crawl_count", 0),
+                    "Last Crawled":  str(crawled)[:16] if crawled else "—",
+                    "Added":         str(e.get("added_at", ""))[:16],
+                })
+            df_wl = pd.DataFrame(rows)
+            st.dataframe(df_wl, use_container_width=True, hide_index=True)
+
+            # ── Pending section ───────────────────────────────────────────
+            if pending:
+                st.divider()
+                st.markdown("#### ⏳ Pending URLs")
+                st.caption("These URLs have never been crawled. Click 'Crawl Now' to go to the Crawl tab with the URL pre-filled.")
+                for e in pending:
+                    pc1, pc2, pc3 = st.columns([5, 2, 1])
+                    pc1.markdown(f"🔗 `{e.get('url','')[:80]}`")
+                    pc2.markdown(f"<small>{e.get('exam_type','')}</small>", unsafe_allow_html=True)
+                    btn_key = f"wl_crawl_{hash(e.get('url',''))}"
+                    if pc3.button("Crawl Now", key=btn_key):
+                        st.session_state["url_input"] = e.get("url", "")
+                        st.info(f"URL pre-filled in Crawl tab: {e.get('url','')[:60]}\n\nGo to the **🕷️ Crawl** tab and click **Start Crawling**.")
+
+            # ── Done section ──────────────────────────────────────────────
+            if done:
+                st.divider()
+                st.markdown("#### ✅ Done URLs")
+                for e in done:
+                    dc1, dc2, dc3, dc4 = st.columns([5, 2, 1, 1])
+                    dc1.markdown(f"🔗 `{e.get('url','')[:75]}`")
+                    dc2.markdown(
+                        f"<small>{str(e.get('last_crawled_at',''))[:16]}</small>",
+                        unsafe_allow_html=True,
+                    )
+                    dc3.markdown(
+                        f"<small>**{e.get('questions_saved', 0)}** Q</small>",
+                        unsafe_allow_html=True,
+                    )
+                    rm_key = f"wl_rm_{hash(e.get('url',''))}"
+                    if dc4.button("🗑️", key=rm_key, help="Remove from watchlist"):
+                        store.watchlist_remove(e.get("url", ""))
+                        st.rerun()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 3 — BROWSE QUESTIONS
 # ════════════════════════════════════════════════════════════════════════════
 with tab_browse:
     store = get_store()
