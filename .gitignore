@@ -1,0 +1,50 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables (contains API keys)
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# uv
+.uv/
+
+# Output data (PDFs and crawled questions are generated, not source)
+output/
+
+# Logs
+*.log
+logs/
+
+# Streamlit
+.streamlit/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude memory (local dev notes)
+.claude/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
